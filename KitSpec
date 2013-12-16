@@ -1,0 +1,4 @@
+name: bpxluuidhandler
+version: 1.0.0
+with-arc: true
+source-directory: BPXLUUIDHandler
