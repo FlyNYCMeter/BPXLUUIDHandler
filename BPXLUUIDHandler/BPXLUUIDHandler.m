@@ -82,12 +82,20 @@
 static CFStringRef account = CFSTR("bpxl_uuid_account");
 static CFStringRef service = CFSTR("bpxl_uuid_service");
 
-static CFMutableDictionaryRef CreateKeychainQueryDictionary(void)
+
+//if the legacyItem flag is true, then don't pass the kSecAttrAccessible attribute to the search
+//this is so we can find existing values and update them to use the kSecAttrAccessibleAfterFirstUnlock value
+//because otherwise we can't access the UUID when the device is locked (e.g. for background pushes)
+static CFMutableDictionaryRef CreateKeychainQueryDictionary(BOOL legacyItem)
 {
-	CFMutableDictionaryRef query = CFDictionaryCreateMutable(kCFAllocatorDefault, 4, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+	CFMutableDictionaryRef query = CFDictionaryCreateMutable(kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
 	CFDictionarySetValue(query, kSecClass, kSecClassGenericPassword);
 	CFDictionarySetValue(query, kSecAttrAccount, account);
 	CFDictionarySetValue(query, kSecAttrService, service);
+	if(!legacyItem)
+	{
+		CFDictionarySetValue(query, kSecAttrAccessible, kSecAttrAccessibleAfterFirstUnlock);
+	}
 #if !TARGET_IPHONE_SIMULATOR
 	if ([BPXLUUIDHandler accessGroup])
 	{
@@ -121,10 +129,13 @@ static CFMutableDictionaryRef CreateKeychainQueryDictionary(void)
 
 + (NSString *)storeUUID:(BOOL)itemExists
 {
+	return [self storeUUIDString:[self generateUUID] itemExists:itemExists];
+}
+
++ (NSString *)storeUUIDString:(NSString *)uuid itemExists:(BOOL)itemExists
+{
 	// Build a query
-	CFMutableDictionaryRef query = CreateKeychainQueryDictionary();
-	
-	NSString *uuid = [[self class] generateUUID];
+	CFMutableDictionaryRef query = CreateKeychainQueryDictionary(NO);
 	
 	CFDataRef dataRef;
 	IF_ARC(
@@ -137,7 +148,7 @@ static CFMutableDictionaryRef CreateKeychainQueryDictionary(void)
 	OSStatus status;
 	if (itemExists)
 	{
-		CFMutableDictionaryRef passwordDictionaryRef = CFDictionaryCreateMutable(kCFAllocatorDefault, 4, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+		CFMutableDictionaryRef passwordDictionaryRef = CFDictionaryCreateMutable(kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
 		CFDictionarySetValue(passwordDictionaryRef, kSecValueData, dataRef);
 		status = SecItemUpdate(query, passwordDictionaryRef);
 		CFRelease(passwordDictionaryRef);
@@ -166,8 +177,11 @@ static NSString *_uuid = nil;
 	if (_uuid != nil)
 		return _uuid;
 	
-	// Build a query
-	CFMutableDictionaryRef query = CreateKeychainQueryDictionary();
+	// Build a query, first trying the new version of the query
+	CFMutableDictionaryRef query = CreateKeychainQueryDictionary(NO);
+	
+	//this is the legacy version of the query to find old UUIDs that haven't been updated
+	CFMutableDictionaryRef legacyQuery = CreateKeychainQueryDictionary(YES);
 	
 	// See if the attribute exists
 	CFTypeRef attributeResult = NULL;
@@ -175,28 +189,52 @@ static NSString *_uuid = nil;
 	if (attributeResult != NULL)
 		CFRelease(attributeResult);
 	
-	if (status != noErr) 
+	BOOL updateRequired = NO;
+	
+	if (status != errSecSuccess)
 	{
-		CFRelease(query);
-		if (status == errSecItemNotFound) // If there's no entry, store one
+		if (status == errSecItemNotFound) // If there's no entry, see if there is an existing one with the legacy format
 		{
-			return [[self class] storeUUID:NO];
+			CFTypeRef legacyAttributeResult = NULL;
+			OSStatus legacyStatus = SecItemCopyMatching(legacyQuery, (CFTypeRef *)&legacyAttributeResult);
+			if (legacyAttributeResult != NULL)
+			{
+				CFRelease(legacyAttributeResult);
+			}
+			if (legacyStatus != errSecSuccess)
+			{
+				if (status == errSecItemNotFound) // If there's no entry now then we have to create one.
+				{
+					CFRelease(legacyQuery);
+					CFRelease(query);
+					return [[self class] storeUUID:NO];
+				}
+			}
+			else
+			{
+				//the item exists, so we need to update it
+				updateRequired = YES;
+			}
 		}
 		else // Any other error, log it and return nil
 		{
+			CFRelease(query);
 			NSLog(@"BPXLUUIDHandler Unhandled Keychain Error %ld", status);
 			return nil;
 		}
 	}
+
+	CFMutableDictionaryRef queryDict = updateRequired ? legacyQuery : query;
 	
 	// Fetch stored attribute
-	CFDictionaryRemoveValue(query, kSecReturnAttributes);
-	CFDictionarySetValue(query, kSecReturnData, (id)kCFBooleanTrue);
+	CFDictionaryRemoveValue(queryDict, kSecReturnAttributes);
+	CFDictionarySetValue(queryDict, kSecReturnData, (id)kCFBooleanTrue);
 	CFTypeRef resultData = NULL;
-	status = SecItemCopyMatching(query, &resultData);
+	status = SecItemCopyMatching(queryDict, &resultData);
 	
-	if (status != noErr) 
+	if (status != errSecSuccess)
 	{
+		CFRelease(legacyQuery);
 		CFRelease(query);
 		if (status == errSecItemNotFound) // If there's no entry, store one
 		{
@@ -208,8 +246,7 @@ static NSString *_uuid = nil;
 			return nil;
 		}
 	}
-	
-	if (resultData != NULL) 
+	if (resultData != NULL)
 	{
 		IF_ARC(
 			   _uuid = [[NSString alloc] initWithData:objc_retainedObject(resultData) encoding:NSUTF8StringEncoding];
@@ -219,8 +256,21 @@ static NSString *_uuid = nil;
 		)
 	}
 	
+	if(updateRequired)
+	{
+		//delete the old UUID and replace it with a new one with updated attributes
+		OSStatus deleteStatus = SecItemDelete(legacyQuery);
+		if (deleteStatus == errSecSuccess)
+		{
+			[self storeUUIDString:_uuid itemExists:NO];
+		}
+		else
+		{
+			NSLog(@"BPXLUUIDHandler Could not update UUID error %ld", deleteStatus);
+		}
+	}
 	CFRelease(query);
-	
+	CFRelease(legacyQuery);
 	return _uuid;
 }
 
@@ -230,7 +280,7 @@ static NSString *_uuid = nil;
 	_uuid = nil;
 	
 	// Build a query
-	CFMutableDictionaryRef query = CreateKeychainQueryDictionary();
+	CFMutableDictionaryRef query = CreateKeychainQueryDictionary(NO);
 	
 	// See if the attribute exists
 	CFTypeRef attributeResult = NULL;
